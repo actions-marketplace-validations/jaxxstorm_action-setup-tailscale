@@ -1,0 +1,204 @@
+name: Tailscale SSH Debug Session
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_type:
+        description: 'Runner type to debug'
+        required: true
+        default: 'ubuntu-latest'
+        type: choice
+        options:
+          - ubuntu-latest
+          - ubuntu-latest-4-cores
+          - ubuntu-latest-8-cores
+          - ubuntu-latest-16-cores
+          - ubuntu-22.04
+          - ubuntu-20.04
+          - macos-latest
+          - macos-13
+          - macos-12
+          - windows-latest
+          - windows-2022
+          - windows-2019
+      timeout_minutes:
+        description: 'SSH session timeout (minutes)'
+        required: true
+        default: '30'
+        type: string
+      ssh_user:
+        description: 'Tailscale SSH user to authorize (your Tailscale login name)'
+        required: true
+        type: string
+
+jobs:
+  tailscale-ssh-debug:
+    name: Tailscale SSH Debug - ${{ inputs.runner_type }}
+    runs-on: ${{ inputs.runner_type }}
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Build action
+        run: npm run build
+        
+      - name: Setup Tailscale with SSH enabled
+        uses: ./
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          version: 'latest'
+        
+      - name: Enable Tailscale SSH
+        shell: bash
+        run: |
+          echo "=== Enabling Tailscale SSH ==="
+          
+          # Enable SSH on this node
+          tailscale up --ssh
+          
+          # Get the node's Tailscale IP and hostname
+          TAILSCALE_IP=$(tailscale ip -4)
+          TAILSCALE_HOSTNAME=$(tailscale status --json | jq -r '.Self.HostName')
+          
+          echo "=== Tailscale SSH Ready ==="
+          echo "Tailscale IP: $TAILSCALE_IP"
+          echo "Tailscale Hostname: $TAILSCALE_HOSTNAME"
+          echo ""
+          echo "🔗 SSH Connection Commands:"
+          echo "  ssh ${{ inputs.ssh_user }}@$TAILSCALE_IP"
+          echo "  ssh ${{ inputs.ssh_user }}@$TAILSCALE_HOSTNAME"
+          echo ""
+          echo "Note: Make sure '${{ inputs.ssh_user }}' has SSH access in your Tailscale ACLs"
+          
+      - name: Authorize SSH user (if needed)
+        shell: bash
+        run: |
+          echo "=== SSH Authorization Info ==="
+          echo "Authorized user: ${{ inputs.ssh_user }}"
+          echo ""
+          echo "To grant SSH access, ensure your Tailscale ACL includes:"
+          echo '  "ssh": ['
+          echo '    {'
+          echo '      "action": "accept",'
+          echo '      "src": ["${{ inputs.ssh_user }}"],'
+          echo '      "dst": ["autogroup:self"],'
+          echo '      "users": ["autogroup:nonroot"]'
+          echo '    }'
+          echo '  ]'
+          echo ""
+          echo "Or use tag-based SSH access in your ACL configuration."
+          
+      - name: Display system information
+        shell: bash
+        run: |
+          echo "=== System Information ==="
+          echo "Runner: ${{ runner.os }} - ${{ runner.arch }}"
+          echo "Hostname: $(hostname)"
+          echo "Kernel: $(uname -a)"
+          echo "CPU Info:"
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            lscpu | head -20
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            sysctl -n machdep.cpu.brand_string
+            sysctl -n hw.ncpu
+          elif [[ "${{ runner.os }}" == "Windows" ]]; then
+            wmic cpu get name
+          fi
+          echo ""
+          echo "Memory:"
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            free -h
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            vm_stat
+          elif [[ "${{ runner.os }}" == "Windows" ]]; then
+            wmic computersystem get TotalPhysicalMemory
+          fi
+          echo ""
+          echo "Disk Space:"
+          df -h
+          echo ""
+          echo "Network Interfaces:"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            ipconfig
+          else
+            ip addr show || ifconfig
+          fi
+          
+      - name: Display current Tailscale status
+        shell: bash
+        run: |
+          echo "=== Current Tailscale Status ==="
+          if command -v tailscale &> /dev/null; then
+            echo "Tailscale is installed and running"
+            tailscale status
+            echo ""
+            tailscale status --json | jq -r '
+              "Device: " + .Self.HostName,
+              "IP: " + .Self.TailscaleIPs[0],
+              "Status: " + .BackendState,
+              "Version: " + .Version,
+              "SSH Enabled: " + (.Self.CapMap.ssh // false | tostring)
+            '
+          else
+            echo "Tailscale not available"
+          fi
+          
+      - name: Wait for SSH connections
+        shell: bash
+        run: |
+          echo "=== Waiting for SSH connections ==="
+          echo "This runner will stay alive for ${{ inputs.timeout_minutes }} minutes"
+          echo ""
+          echo "🔗 Connect via Tailscale SSH using:"
+          TAILSCALE_IP=$(tailscale ip -4)
+          TAILSCALE_HOSTNAME=$(tailscale status --json | jq -r '.Self.HostName')
+          echo "  ssh ${{ inputs.ssh_user }}@$TAILSCALE_IP"
+          echo "  ssh ${{ inputs.ssh_user }}@$TAILSCALE_HOSTNAME"
+          echo ""
+          echo "Runner will automatically terminate after timeout or manual cancellation."
+          echo "Current time: $(date)"
+          echo ""
+          
+          # Keep the runner alive for the specified timeout
+          TIMEOUT_SECONDS=$(($(echo "${{ inputs.timeout_minutes }}" | bc) * 60))
+          echo "Sleeping for $TIMEOUT_SECONDS seconds..."
+          
+          # Use a loop with shorter sleeps to allow for interruption
+          for ((i=0; i<TIMEOUT_SECONDS; i+=30)); do
+            sleep 30
+            if ((i % 300 == 0)); then  # Every 5 minutes
+              echo "Still alive... $(date) (${i}s elapsed)"
+              tailscale status | head -5
+            fi
+          done
+          
+          echo "Timeout reached. Ending debug session."
+          
+      - name: Cleanup (Post SSH)
+        if: always()
+        shell: bash
+        run: |
+          echo "=== SSH Session Ended ==="
+          echo "Timestamp: $(date)"
+          echo "Session duration: ${{ inputs.timeout_minutes }} minutes (max)"
+          
+          # Display any logs that might be helpful
+          if command -v tailscale &> /dev/null; then
+            echo ""
+            echo "=== Final Tailscale Status ==="
+            tailscale status
+          fi
+          
+          echo ""
+          echo "=== Cleanup completed ==="
